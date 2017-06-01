@@ -62,12 +62,21 @@
   "Set to t if you don't want to see non-error messages.")
 (defvar importmagic-server nil
   "The importmagic index server.")
+(defvar importmagic-index-ready nil
+  "This variable is set to t when the importmagic index is ready to be queried.
+
+Don't set this variable manually.")
 (make-variable-buffer-local 'importmagic-server)
+(make-variable-buffer-local 'importmagic-index-ready)
 
 (defun importmagic--message (msg &rest args)
   "Show the message MSG with ARGS only if importmagic is set to not be quiet."
   (when (not importmagic-be-quiet)
-    (message msg args)))
+    (message (concat "[importmagic] " msg) args)))
+
+(defun importmagic--fail (msg)
+  "Display an error message MSG and ring the bell when importmagic fails."
+  (error (concat "[importmagic] " msg)))
 
 ;;;###autoload
 (define-minor-mode importmagic-mode
@@ -79,22 +88,26 @@
             keymap)
   (when (not (derived-mode-p 'python-mode))
     (error "Importmagic only works with Python buffers"))
-  (let ((importmagic-path (f-slash (f-dirname (locate-library "importmagic")))))
-    (if importmagic-mode
-        (progn
-          (condition-case nil
-              (progn
-                (setq importmagic-server
-                      (epc:start-epc "python"
-                                     `(,(f-join importmagic-path "importmagicserver.py"))))
-                (add-hook 'kill-buffer-hook 'importmagic--teardown-epc)
-                (add-hook 'before-revert-hook 'importmagic--teardown-epc)
-                (importmagic--auto-update-index))
-            (error (progn
-                     (message "Importmagic and/or epc not found. importmagic.el will not be working.")
-                     (importmagic-mode -1) ;; This should take it to the stop server section.
-                     ))))
-      (importmagic--stop-server))))
+  (if (not importmagic-mode)
+      (importmagic--stop-server)
+    (condition-case nil
+        (importmagic--setup)
+      (error (progn
+               (message "Importmagic and/or epc not found. importmagic.el will not be working.")
+               (importmagic-mode -1) ;; This should take it to the stop server section.
+               )))))
+
+(defun importmagic--setup ()
+  "Set up importmagic after enabling the minor mode."
+  (progn
+    (let ((importmagic-path (f-slash (f-dirname (locate-library "importmagic")))))
+      (setq importmagic-server
+            (epc:start-epc "python"
+                           `(,(f-join importmagic-path "importmagicserver.py"))))
+      (add-hook 'kill-buffer-hook 'importmagic--teardown-epc)
+      (add-hook 'before-revert-hook 'importmagic--teardown-epc)
+      (importmagic--build-index))
+    t))
 
 (defun importmagic--teardown-epc ()
   "Stop the EPC server for the current buffer."
@@ -112,9 +125,36 @@
     (epc:stop-epc importmagic-server))
   (setq importmagic-server nil))
 
+(defun importmagic--get-top-level ()
+  "Get the top level python package for the current file."
+  (let ((toplevel (f-dirname (f-this-file))))
+    (while (f-exists-p (f-join toplevel "__init__.py"))
+      (setq toplevel (f-dirname toplevel)))
+    toplevel))
+
+(defun importmagic--build-index ()
+  "Build index for current file."
+  (setq importmagic-index-ready nil)
+  (deferred:$
+    (epc:call-deferred importmagic-server
+                       'build_index
+                       `(,(importmagic--get-toplevel)))
+    (deferred:nextc it
+      (lambda (result)
+        (setq importmagic-index-ready t)
+        (importmagic--message "Index ready.")))))
+
 (defun importmagic--buffer-as-string ()
   "Return the whole contents of the buffer as a single string."
   (buffer-substring-no-properties (point-min) (point-max)))
+
+(defun importmagic--call-epc (fun &rest args)
+  "Call FUN with ARGS in the epc for the current buffer."
+  (if importmagic-index-ready
+      (epc:call-sync importmagic-server
+                     fun
+                     args)
+    (importmagic--fail "Index not ready yet. Hang on...")))
 
 (defun importmagic--fix-imports (import-block start end)
   "Insert given IMPORT-BLOCK with import fixups in the current buffer starting in line START and ending in line END."
@@ -131,9 +171,8 @@
 
 (defun importmagic--query-imports-for-statement-and-fix (statement)
   "Query importmagic server for STATEMENT imports in the current buffer."
-  (let* ((specs (epc:call-sync importmagic-server
-                               'get_import_statement
-                               `(,(importmagic--buffer-as-string) ,statement)))
+  (let* ((specs (importmagic--call-epc 'get_import_statement
+                                       (importmagic--buffer-as-string) statement))
          (start (car specs))
          (end (cadr specs))
          (theblock (caddr specs)))
@@ -142,11 +181,10 @@
 (defun importmagic-fix-symbol (symbol)
   "Fix imports for SYMBOL in current buffer."
   (interactive "sSymbol: ")
-  (let ((options (epc:call-sync importmagic-server
-                                'get_candidates_for_symbol
-                                symbol)))
+  (let ((options (importmagic--call-epc 'get_candidates_for_symbol
+                                        symbol)))
     (if (not options)
-        (error "[importmagic] No suitable candidates found for %s" symbol)
+        (error "No suitable candidates found for %s" symbol)
       (let ((choice (completing-read (concat "Querying for " symbol ": ")
                                      options
                                      nil
@@ -155,7 +193,7 @@
                                      nil
                                      options)))
         (importmagic--query-imports-for-statement-and-fix choice)
-        (importmagic--message "[importmagic] Inserted %s" choice)))))
+        (importmagic--message "Inserted %s" choice)))))
 
 (defun importmagic-fix-symbol-at-point ()
   "Fix imports for symbol at point."
@@ -164,7 +202,7 @@
 
 (defun importmagic--get-unresolved-symbols ()
   "Query the RPC server for every unresolved symbol in the current file."
-  (epc:call-sync importmagic-server 'get_unresolved_symbols (importmagic--buffer-as-string)))
+  (importmagic--call-epc 'get_unresolved_symbols (importmagic--buffer-as-string)))
 
 (defun importmagic-fix-imports ()
   "Fix every possible import in the file."
@@ -176,25 +214,10 @@
           (importmagic-fix-symbol symbol)
         (error (setq no-candidates (push symbol no-candidates)))))
     (when no-candidates
-      (importmagic--message "[importmagic] Symbols with no candidates: %s" no-candidates))))
+      (importmagic--message "Symbols with no candidates: %s" no-candidates))))
 
-(defun importmagic--auto-update-index ()
-  "Update importmagic symbol index with current directory."
-  (when (and (derived-mode-p 'python-mode)
-             (f-this-file))
-    (importmagic--async-add-dir
-     (f-dirname (f-this-file)))))
-
-(defun importmagic--async-add-dir (path)
-  "Asynchronously add PATH to index symbol."
-  (deferred:$
-    (epc:call-deferred importmagic-server 'add_directory_to_index path)
-    (deferred:nextc it
-      `(lambda (result)
-         (if (stringp result)
-             (error "[importmagic] Couldn't update index")
-           (importmagic--message "[importmagic] Indexed %s" ,path))))))
-
+(defun importmagic--echo-test ()
+  (importmagic--call-epc 'echo (concat "Hola" "wmazo")))
 
 
 (provide 'importmagic)

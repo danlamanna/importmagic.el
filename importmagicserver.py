@@ -8,10 +8,7 @@ Licensed under GPL3. See the LICENSE file for details
 
 """
 
-
-import os
 import sys
-import threading
 from collections import deque
 
 import importmagic
@@ -33,41 +30,20 @@ def _stringify(input_param):
     return ''.join(input_param)
 
 
-# Construct the symbol index specified by the paths given. As the
-# names suggest, these paths correspond to sys path and user_path. We
-# still have to figure out if sys.path and user_path default values
-# are ok.
-def _build_index(sys_path=sys.path, user_path=None):
-    # since index is a global variable, need the global keyword. I did
-    # not know this
-    # http://stackoverflow.com/questions/423379/using-global-variables-in-a-function-other-than-the-one-that-created-them
+# Construct the index symbol with top level path specified in the
+# argument.
+@server.register_function
+def build_index(*path):
     global index
+
+    fullpath = sys.path + [_stringify(path)]
+
     try:
-        paths = []
-
-        if user_path is not None:
-            if isinstance(user_path, list):
-                paths = paths + user_path
-            else:
-                paths.append(user_path)
-
-        if isinstance(sys_path, list):
-            paths = paths + sys_path
-        else:
-            paths.append(sys_path)
-
         index = importmagic.SymbolIndex()
-        index.build_index(paths=paths)
+        index.build_index(paths=fullpath)
     except:
         print('Failed to build index')
         sys.exit(-1)
-
-
-# Launch a thread that builds the index.
-def build_index(sys_path=sys.path, user_path=None):
-    thread = threading.Thread(target=_build_index, args=(user_path, sys_path))
-    thread.daemon = True
-    thread.start()
 
 
 # Returns a list of every unresolved symbol in source.
@@ -126,43 +102,5 @@ def get_import_statement(*source_and_import):
     return [start, end, new_statement]
 
 
-# Adds the specified path to symbol index.
-@server.register_function
-def add_path_to_index(*path):
-    path = _stringify(path)
-
-    global index
-    if index is None:
-        return "Index not ready. Hang on a second."
-
-    index.index_path(path)
-    return 0
-
-
-@server.register_function
-def add_directory_to_index(*path):
-    path = _stringify(path)
-
-    everything = os.listdir(path)
-    files = []
-    dirs = [d for d in everything if os.path.isdir(os.path.join(path, d))]
-
-    for something in everything:
-        if os.path.isfile(os.path.join(path, something)):
-            if something.endswith('.py') and not something.startswith(
-                    '__init__'):
-                files.append(os.path.join(path, something))
-
-    for file in files:
-        index.index_path(file)
-
-    # Not sure about this one.
-    for dir in dirs:
-        index.index_path(dir)
-
-    return 0
-
-
-build_index()
 server.print_port()
 server.serve_forever()
